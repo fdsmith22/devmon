@@ -1,0 +1,22 @@
+# Compiled binaries
+bin/devmon-menubar
+*.o
+
+# App bundle (built from source)
+DevMon.app/
+
+# macOS
+.DS_Store
+._*
+
+# Logs
+*.log
+
+# State files
+state/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~

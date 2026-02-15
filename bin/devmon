@@ -1,0 +1,721 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+# =============================================================================
+# DevMon - Development Process Monitor
+# Automatically cleans up orphaned dev processes on macOS
+# Bash 3.2 compatible (macOS default)
+# =============================================================================
+
+# ANSI Colors
+readonly RED='\033[0;31m'
+readonly YELLOW='\033[1;33m'
+readonly GREEN='\033[0;32m'
+readonly CYAN='\033[0;36m'
+readonly BOLD='\033[1m'
+readonly NC='\033[0m'
+
+# Configuration
+DEVMON_DIR="$HOME/.config/devmon"
+CONFIG_FILE="$DEVMON_DIR/config.sh"
+
+# Source config if exists
+if [[ -f "$CONFIG_FILE" ]]; then
+  source "$CONFIG_FILE"
+fi
+
+# Set defaults for anything not configured
+: "${DEVMON_WARN_THRESHOLD:=60}"
+: "${DEVMON_EMERGENCY_THRESHOLD:=80}"
+: "${DEVMON_IDLE_NORMAL:=1800}"
+: "${DEVMON_IDLE_EMERGENCY:=600}"
+: "${DEVMON_PORT_MIN:=3000}"
+: "${DEVMON_PORT_MAX:=9000}"
+: "${DEVMON_PROCESS_PATTERN:=node|next-server|vite|webpack|esbuild|postcss|turbopack|ts-node|tsx}"
+: "${DEVMON_LOG_DIR:=$HOME/Library/Logs/devmon}"
+: "${DEVMON_LOG_MAX_SIZE:=5242880}"
+: "${DEVMON_LOG_KEEP:=3}"
+: "${DEVMON_STATE_DIR:=$HOME/.config/devmon/state}"
+: "${DEVMON_NOTIFY:=1}"
+
+# Default whitelist if not set
+if ! declare -p DEVMON_WHITELIST >/dev/null 2>&1 || [[ ${#DEVMON_WHITELIST[@]} -eq 0 ]]; then
+  DEVMON_WHITELIST=("mongod" "context7-mcp" "claude" "Spotify")
+fi
+
+# Ensure directories exist
+mkdir -p "$DEVMON_LOG_DIR" "$DEVMON_STATE_DIR"
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+log() {
+  local level="$1"
+  shift
+  local msg="$*"
+  local timestamp
+  timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+  rotate_log
+  echo "[$timestamp] [$level] $msg" >> "$DEVMON_LOG_DIR/devmon.log"
+}
+
+rotate_log() {
+  local logfile="$DEVMON_LOG_DIR/devmon.log"
+
+  if [[ ! -f "$logfile" ]]; then
+    return 0
+  fi
+
+  local size
+  size=$(stat -f%z "$logfile" 2>/dev/null || echo 0)
+
+  if [[ $size -gt $DEVMON_LOG_MAX_SIZE ]]; then
+    # Rotate logs
+    local i=$((DEVMON_LOG_KEEP - 1))
+    while [[ $i -gt 0 ]]; do
+      local prev=$((i - 1))
+      if [[ -f "$logfile.$prev" ]]; then
+        mv "$logfile.$prev" "$logfile.$i"
+      fi
+      i=$prev
+    done
+
+    mv "$logfile" "$logfile.1"
+    touch "$logfile"
+  fi
+}
+
+notify() {
+  local subtitle="$1"
+  local message="$2"
+
+  if [[ $DEVMON_NOTIFY -eq 1 ]]; then
+    osascript -e "display notification \"$message\" with title \"DevMon\" subtitle \"$subtitle\"" 2>/dev/null || true
+  fi
+}
+
+get_memory_pressure() {
+  local page_size
+  page_size=$(sysctl -n hw.pagesize 2>/dev/null || echo 4096)
+
+  local vm_output
+  vm_output=$(vm_stat 2>/dev/null || echo "")
+
+  if [[ -z "$vm_output" ]]; then
+    echo "0"
+    return
+  fi
+
+  local active
+  active=$(echo "$vm_output" | awk '/Pages active/ {gsub(/\./,"",$NF); print $NF}' || echo 0)
+
+  local wired
+  wired=$(echo "$vm_output" | awk '/Pages wired/ {gsub(/\./,"",$NF); print $NF}' || echo 0)
+
+  local compressed
+  compressed=$(echo "$vm_output" | awk '/Pages occupied by compressor/ {gsub(/\./,"",$NF); print $NF}' || echo 0)
+
+  local total_bytes
+  total_bytes=$(sysctl -n hw.memsize 2>/dev/null || echo 1)
+
+  local used_bytes=$(( (active + wired + compressed) * page_size ))
+  local pressure=$(( used_bytes * 100 / total_bytes ))
+
+  echo "$pressure"
+}
+
+is_whitelisted() {
+  local cmd="$1"
+  local w
+
+  for w in "${DEVMON_WHITELIST[@]}"; do
+    if [[ "$cmd" == *"$w"* ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+get_orphaned_devs() {
+  local pattern="$DEVMON_PROCESS_PATTERN"
+
+  ps -eo pid,ppid,tty,etime,comm,args 2>/dev/null | grep -E "$pattern" | grep -v grep | while IFS= read -r line; do
+    local pid ppid tty etime comm args
+
+    # Parse ps output
+    pid=$(echo "$line" | awk '{print $1}')
+    ppid=$(echo "$line" | awk '{print $2}')
+    tty=$(echo "$line" | awk '{print $3}')
+    etime=$(echo "$line" | awk '{print $4}')
+
+    # Get full command (everything after etime)
+    local cmd
+    cmd=$(echo "$line" | awk '{for(i=5;i<=NF;i++) printf "%s ", $i; print ""}')
+
+    # Check if TTY is ??
+    if [[ "$tty" != "??" ]]; then
+      continue
+    fi
+
+    # Check if parent is 1 or doesn't exist
+    if [[ "$ppid" != "1" ]]; then
+      if kill -0 "$ppid" 2>/dev/null; then
+        continue
+      fi
+    fi
+
+    # Check whitelist
+    if is_whitelisted "$cmd"; then
+      continue
+    fi
+
+    echo "$pid $etime $cmd"
+  done
+}
+
+parse_etime_to_seconds() {
+  local etime="$1"
+  local seconds=0
+
+  # Format can be: MM:SS, HH:MM:SS, or D-HH:MM:SS
+  if [[ "$etime" =~ ^([0-9]+)-(.+)$ ]]; then
+    # D-HH:MM:SS format
+    local days="${BASH_REMATCH[1]}"
+    local rest="${BASH_REMATCH[2]}"
+    seconds=$((days * 86400))
+    etime="$rest"
+  fi
+
+  local parts
+  IFS=':' read -ra parts <<< "$etime"
+
+  if [[ ${#parts[@]} -eq 2 ]]; then
+    # MM:SS
+    seconds=$((seconds + parts[0] * 60 + parts[1]))
+  elif [[ ${#parts[@]} -eq 3 ]]; then
+    # HH:MM:SS
+    seconds=$((seconds + parts[0] * 3600 + parts[1] * 60 + parts[2]))
+  fi
+
+  echo "$seconds"
+}
+
+track_orphan_age() {
+  local pid="$1"
+  local state_file="$DEVMON_STATE_DIR/orphans.txt"
+  local now
+  now=$(date +%s)
+
+  # Create state file if it doesn't exist
+  if [[ ! -f "$state_file" ]]; then
+    touch "$state_file"
+  fi
+
+  # Clean up dead PIDs
+  local temp_file="$state_file.tmp"
+  : > "$temp_file"
+
+  while IFS=' ' read -r tracked_pid first_seen; do
+    if [[ -n "$tracked_pid" ]] && kill -0 "$tracked_pid" 2>/dev/null; then
+      echo "$tracked_pid $first_seen" >> "$temp_file"
+    fi
+  done < "$state_file"
+
+  mv "$temp_file" "$state_file"
+
+  # Check if this PID is already tracked
+  local first_seen
+  first_seen=$(grep "^$pid " "$state_file" 2>/dev/null | awk '{print $2}')
+
+  if [[ -n "$first_seen" ]]; then
+    echo $((now - first_seen))
+  else
+    # New orphan - track it
+    echo "$pid $now" >> "$state_file"
+    echo "0"
+  fi
+}
+
+kill_process() {
+  local pid="$1"
+  local cmd="$2"
+
+  # Verify process still exists
+  if ! kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+
+  log "INFO" "Killing orphaned process: PID $pid ($cmd)"
+  notify "Process Killed" "PID $pid: $cmd"
+
+  # Send SIGTERM
+  kill -15 "$pid" 2>/dev/null || return 0
+
+  # Wait up to 5 seconds
+  local i=0
+  while [[ $i -lt 50 ]]; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      # Process died
+      sed -i.bak "/^$pid /d" "$DEVMON_STATE_DIR/orphans.txt" 2>/dev/null || true
+      rm -f "$DEVMON_STATE_DIR/orphans.txt.bak"
+      return 0
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+
+  # Still alive - SIGKILL
+  kill -9 "$pid" 2>/dev/null || true
+  sed -i.bak "/^$pid /d" "$DEVMON_STATE_DIR/orphans.txt" 2>/dev/null || true
+  rm -f "$DEVMON_STATE_DIR/orphans.txt.bak"
+}
+
+get_stale_ports() {
+  if ! command -v lsof >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local seen_ports=""
+  lsof -iTCP -sTCP:LISTEN -nP 2>/dev/null | tail -n +2 | while IFS= read -r line; do
+    local port
+    port=$(echo "$line" | awk '{print $9}' | sed 's/.*://')
+
+    # Check if port is in range
+    if [[ "$port" =~ ^[0-9]+$ ]] && [[ $port -ge $DEVMON_PORT_MIN ]] && [[ $port -le $DEVMON_PORT_MAX ]]; then
+      # Deduplicate IPv4/IPv6 listeners on same port
+      if echo "$seen_ports" | grep -q ":${port}:"; then
+        continue
+      fi
+      seen_ports="${seen_ports}:${port}:"
+
+      # Count established connections to this port
+      local established
+      established=$(lsof -iTCP:"$port" -sTCP:ESTABLISHED 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')
+
+      if [[ $established -eq 0 ]]; then
+        local pid cmd
+        pid=$(echo "$line" | awk '{print $2}')
+        cmd=$(echo "$line" | awk '{print $1}')
+        echo "$port $pid $cmd"
+      fi
+    fi
+  done
+}
+
+get_swap_usage() {
+  local swap_info
+  swap_info=$(sysctl vm.swapusage 2>/dev/null | cut -d= -f2- | sed 's/M//' | sed 's/G/*1024/')
+
+  if [[ -z "$swap_info" ]]; then
+    echo "0"
+    return
+  fi
+
+  local used
+  used=$(echo "$swap_info" | awk '{print $4}' | sed 's/\..*$//')
+  echo "${used:-0}"
+}
+
+format_age() {
+  local seconds="$1"
+  local hours=$((seconds / 3600))
+  local minutes=$(( (seconds % 3600) / 60 ))
+
+  if [[ $hours -gt 0 ]]; then
+    printf "%dh %dm" "$hours" "$minutes"
+  else
+    printf "%dm" "$minutes"
+  fi
+}
+
+# =============================================================================
+# CLI Commands
+# =============================================================================
+
+cmd_run() {
+  # Check if paused
+  if [[ -f "$DEVMON_STATE_DIR/paused" ]]; then
+    log "INFO" "Monitor paused, skipping cycle"
+    return 0
+  fi
+
+  log "INFO" "Starting monitoring cycle"
+
+  # Get memory pressure
+  local pressure
+  pressure=$(get_memory_pressure)
+
+  # Determine threshold
+  local threshold=$DEVMON_IDLE_NORMAL
+  if [[ $pressure -ge $DEVMON_EMERGENCY_THRESHOLD ]]; then
+    threshold=$DEVMON_IDLE_EMERGENCY
+    log "WARN" "Memory pressure at ${pressure}% - EMERGENCY mode (${threshold}s threshold)"
+    notify "Memory Pressure" "EMERGENCY: ${pressure}% - Aggressive cleanup enabled"
+  elif [[ $pressure -ge $DEVMON_WARN_THRESHOLD ]]; then
+    log "WARN" "Memory pressure at ${pressure}% - WARNING"
+  fi
+
+  # Process orphans
+  local orphans_found=0
+  local killed=0
+
+  while IFS=' ' read -r pid etime cmd; do
+    if [[ -z "$pid" ]]; then
+      continue
+    fi
+
+    orphans_found=$((orphans_found + 1))
+
+    # Track age
+    local age
+    age=$(track_orphan_age "$pid")
+
+    if [[ $age -gt $threshold ]]; then
+      kill_process "$pid" "$cmd"
+      killed=$((killed + 1))
+    else
+      local remaining=$((threshold - age))
+      log "INFO" "Orphan PID $pid (age ${age}s) - will kill in ${remaining}s"
+    fi
+  done < <(get_orphaned_devs)
+
+  # Report stale ports (info only)
+  while IFS=' ' read -r port pid cmd; do
+    if [[ -n "$port" ]]; then
+      log "INFO" "Stale port :$port (PID $pid, $cmd, 0 connections)"
+    fi
+  done < <(get_stale_ports)
+
+  log "INFO" "Cycle complete: pressure=${pressure}%, orphans_found=${orphans_found}, killed=${killed}"
+}
+
+cmd_status() {
+  local pressure
+  pressure=$(get_memory_pressure)
+
+  local swap
+  swap=$(get_swap_usage)
+
+  # Header
+  printf "\n${BOLD}DevMon Status${NC}\n"
+  printf "═══════════════════════════════\n"
+
+  # Memory pressure bar
+  local bar_filled=$((pressure / 10))
+  local bar_empty=$((10 - bar_filled))
+  local bar=""
+
+  local i
+  for i in $(seq 1 $bar_filled); do
+    bar="${bar}▓"
+  done
+  for i in $(seq 1 $bar_empty); do
+    bar="${bar}░"
+  done
+
+  local status_color=$GREEN
+  local status_text="OK"
+
+  if [[ $pressure -ge $DEVMON_EMERGENCY_THRESHOLD ]]; then
+    status_color=$RED
+    status_text="CRITICAL"
+  elif [[ $pressure -ge $DEVMON_WARN_THRESHOLD ]]; then
+    status_color=$YELLOW
+    status_text="WARNING"
+  fi
+
+  printf "Memory Pressure: ${status_color}%d%% %s [%s]${NC}\n" "$pressure" "$bar" "$status_text"
+  printf "Swap Usage: %d MB\n\n" "$swap"
+
+  # Dev processes
+  printf "${BOLD}Dev Processes (orphaned):${NC}\n"
+
+  local threshold=$DEVMON_IDLE_NORMAL
+  if [[ $pressure -ge $DEVMON_EMERGENCY_THRESHOLD ]]; then
+    threshold=$DEVMON_IDLE_EMERGENCY
+  fi
+
+  local found=0
+  while IFS=' ' read -r pid etime cmd; do
+    if [[ -z "$pid" ]]; then
+      continue
+    fi
+
+    found=1
+    local age
+    age=$(track_orphan_age "$pid")
+
+    local age_formatted
+    age_formatted=$(format_age "$age")
+
+    local remaining=$((threshold - age))
+
+    # Truncate command
+    local cmd_short
+    cmd_short=$(echo "$cmd" | cut -c1-40)
+
+    if [[ $remaining -le 300 ]]; then
+      printf "  ${RED}PID %-6s %-40s age: %-10s ← KILLING SOON${NC}\n" "$pid" "$cmd_short" "$age_formatted"
+    else
+      local remaining_formatted
+      remaining_formatted=$(format_age "$remaining")
+      printf "  ${YELLOW}PID %-6s %-40s age: %-10s ← will kill in %s${NC}\n" "$pid" "$cmd_short" "$age_formatted" "$remaining_formatted"
+    fi
+  done < <(get_orphaned_devs)
+
+  if [[ $found -eq 0 ]]; then
+    printf "  ${GREEN}None${NC}\n"
+  fi
+
+  printf "\n"
+
+  # Listening ports
+  printf "${BOLD}Listening Ports:${NC}\n"
+
+  local port_found=0
+  while IFS=' ' read -r port pid cmd; do
+    if [[ -z "$port" ]]; then
+      continue
+    fi
+
+    port_found=1
+    printf "  ${CYAN}:%-6s PID %-6s %-20s (0 connections) ← stale${NC}\n" "$port" "$pid" "$cmd"
+  done < <(get_stale_ports)
+
+  # Also show ports with connections (use process substitution to avoid subshell scoping)
+  local seen_active=""
+  if command -v lsof >/dev/null 2>&1; then
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      local lport
+      lport=$(echo "$line" | awk '{print $9}' | sed 's/.*://')
+
+      if [[ "$lport" =~ ^[0-9]+$ ]] && [[ $lport -ge $DEVMON_PORT_MIN ]] && [[ $lport -le $DEVMON_PORT_MAX ]]; then
+        # Deduplicate IPv4/IPv6
+        if echo "$seen_active" | grep -q ":${lport}:"; then
+          continue
+        fi
+        seen_active="${seen_active}:${lport}:"
+
+        local established
+        established=$(lsof -iTCP:"$lport" -sTCP:ESTABLISHED 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')
+
+        if [[ $established -gt 0 ]]; then
+          port_found=1
+          local lpid lcmd
+          lpid=$(echo "$line" | awk '{print $2}')
+          lcmd=$(echo "$line" | awk '{print $1}')
+          printf "  :%-6s PID %-6s %-20s (%d connections)\n" "$lport" "$lpid" "$lcmd" "$established"
+        fi
+      fi
+    done < <(lsof -iTCP -sTCP:LISTEN -nP 2>/dev/null | tail -n +2 || true)
+  fi
+
+  if [[ $port_found -eq 0 ]]; then
+    printf "  ${GREEN}None${NC}\n"
+  fi
+
+  printf "\n"
+
+  # Monitor state
+  local state="${GREEN}ACTIVE${NC}"
+  if [[ -f "$DEVMON_STATE_DIR/paused" ]]; then
+    state="${YELLOW}PAUSED${NC}"
+  fi
+
+  printf "Monitor: %b\n\n" "$state"
+}
+
+cmd_kill() {
+  local pattern="$DEVMON_PROCESS_PATTERN"
+
+  # Build list of processes
+  local pids=()
+  local cmds=()
+  local ports=()
+
+  while IFS= read -r line; do
+    local pid cmd port
+    pid=$(echo "$line" | awk '{print $1}')
+    cmd=$(echo "$line" | awk '{for(i=5;i<=NF;i++) printf "%s ", $i; print ""}' | cut -c1-60)
+
+    # Try to get listening port
+    port=""
+    if command -v lsof >/dev/null 2>&1; then
+      port=$(lsof -iTCP -sTCP:LISTEN -nP -p "$pid" 2>/dev/null | tail -n +2 | awk '{print $9}' | sed 's/.*://' | head -1)
+    fi
+
+    pids+=("$pid")
+    cmds+=("$cmd")
+    ports+=("${port:-}")
+  done < <(ps -eo pid,ppid,tty,etime,comm,args 2>/dev/null | grep -E "$pattern" | grep -v grep)
+
+  if [[ ${#pids[@]} -eq 0 ]]; then
+    echo "No dev processes found."
+    return 0
+  fi
+
+  # Display list
+  printf "\n${BOLD}Dev Processes:${NC}\n"
+
+  local i
+  for i in "${!pids[@]}"; do
+    local idx=$((i + 1))
+    local port_str=""
+    if [[ -n "${ports[$i]}" ]]; then
+      port_str=" :${ports[$i]}"
+    fi
+    printf "[%2d] PID %-6s %s%s\n" "$idx" "${pids[$i]}" "${cmds[$i]}" "$port_str"
+  done
+
+  printf "\n"
+
+  # Prompt
+  printf "Kill which? (number, 'all', or 'q'): "
+  read -r choice
+
+  if [[ "$choice" == "q" ]]; then
+    return 0
+  fi
+
+  if [[ "$choice" == "all" ]]; then
+    printf "Kill all %d processes? (y/N): " "${#pids[@]}"
+    read -r confirm
+
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+      echo "Cancelled."
+      return 0
+    fi
+
+    for i in "${!pids[@]}"; do
+      kill_process "${pids[$i]}" "${cmds[$i]}"
+      echo "Killed PID ${pids[$i]}"
+    done
+  else
+    if [[ ! "$choice" =~ ^[0-9]+$ ]]; then
+      echo "Invalid choice."
+      return 1
+    fi
+
+    local idx=$((choice - 1))
+    if [[ $idx -lt 0 || $idx -ge ${#pids[@]} ]]; then
+      echo "Invalid number."
+      return 1
+    fi
+
+    kill_process "${pids[$idx]}" "${cmds[$idx]}"
+    echo "Killed PID ${pids[$idx]}"
+  fi
+}
+
+cmd_clean() {
+  local cleaner="$HOME/.local/bin/devmon-cache-clean"
+
+  if [[ ! -x "$cleaner" ]]; then
+    echo "Error: Cache cleaner not found at $cleaner"
+    return 1
+  fi
+
+  exec "$cleaner" "$@"
+}
+
+cmd_log() {
+  local logfile="$DEVMON_LOG_DIR/devmon.log"
+
+  if [[ ! -f "$logfile" ]]; then
+    echo "No log file found at $logfile"
+    return 0
+  fi
+
+  tail -f "$logfile"
+}
+
+cmd_pause() {
+  touch "$DEVMON_STATE_DIR/paused"
+  log "INFO" "Monitoring paused by user"
+  notify "Paused" "Monitoring paused"
+  echo "DevMon monitoring paused."
+}
+
+cmd_resume() {
+  rm -f "$DEVMON_STATE_DIR/paused"
+  log "INFO" "Monitoring resumed by user"
+  notify "Resumed" "Monitoring resumed"
+  echo "DevMon monitoring resumed."
+}
+
+cmd_install() {
+  launchctl load "$HOME/Library/LaunchAgents/com.devmon.monitor.plist" 2>/dev/null || true
+  launchctl load "$HOME/Library/LaunchAgents/com.devmon.cache-clean.plist" 2>/dev/null || true
+  launchctl load "$HOME/Library/LaunchAgents/com.devmon.menubar.plist" 2>/dev/null || true
+
+  echo "DevMon agents installed and loaded."
+  echo "Monitor runs every 5 minutes. Cache cleanup weekly Sunday 3am."
+  echo "Menu bar icon active."
+}
+
+cmd_uninstall() {
+  launchctl unload "$HOME/Library/LaunchAgents/com.devmon.monitor.plist" 2>/dev/null || true
+  launchctl unload "$HOME/Library/LaunchAgents/com.devmon.cache-clean.plist" 2>/dev/null || true
+  launchctl unload "$HOME/Library/LaunchAgents/com.devmon.menubar.plist" 2>/dev/null || true
+
+  echo "DevMon agents unloaded."
+}
+
+cmd_help() {
+  cat << 'EOF'
+DevMon - Development Process Monitor
+
+USAGE:
+  devmon [COMMAND]
+
+COMMANDS:
+  run         Run monitoring cycle (called by launchd)
+  status      Show current system status with memory pressure and processes
+  kill        Interactive dev process killer
+  clean       Run cache cleanup (devmon clean --help for options)
+  log         Tail the DevMon log file
+  pause       Pause automatic monitoring
+  resume      Resume automatic monitoring
+  install     Install and load launchd agents
+  uninstall   Unload launchd agents
+  help        Show this help message
+
+EXAMPLES:
+  devmon status               # Check current state
+  devmon kill                 # Interactively kill dev processes
+  devmon clean --dry-run      # Preview cache cleanup
+  devmon pause                # Pause monitoring temporarily
+  devmon log                  # Watch live log
+
+CONFIGURATION:
+  Edit ~/.config/devmon/config.sh to customize thresholds, patterns, etc.
+
+EOF
+}
+
+# =============================================================================
+# Main Dispatch
+# =============================================================================
+
+case "${1:-run}" in
+  run)       cmd_run ;;
+  status)    cmd_status ;;
+  kill)      cmd_kill ;;
+  clean)     shift; cmd_clean "$@" ;;
+  log)       cmd_log ;;
+  pause)     cmd_pause ;;
+  resume)    cmd_resume ;;
+  install)   cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  help|-h|--help) cmd_help ;;
+  *)
+    echo "Unknown command: $1"
+    cmd_help
+    exit 1
+    ;;
+esac

@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# DevMon Cache Cleanup
+# Clean up development-related caches to recover disk space
+
+## Configuration
+DEVMON_DIR="$HOME/.config/devmon"
+CONFIG_FILE="$DEVMON_DIR/config.sh"
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+# Set defaults
+: "${DEVMON_CACHE_JETBRAINS_MAX_DAYS:=7}"
+: "${DEVMON_CACHE_PLAYWRIGHT_MAX_DAYS:=14}"
+: "${DEVMON_CACHE_NODE_MODULES_MAX_DAYS:=30}"
+: "${DEVMON_CACHE_HOMEBREW_MAX_DAYS:=14}"
+: "${DEVMON_LOG_DIR:=$HOME/Library/Logs/devmon}"
+: "${DEVMON_NOTIFY:=1}"
+
+## Globals
+TOTAL_RECOVERED=0
+DRY_RUN=0
+
+## Helper Functions
+
+log() {
+  local msg="$1"
+  local timestamp
+  timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+  mkdir -p "$DEVMON_LOG_DIR"
+  echo "[$timestamp] $msg" >> "$DEVMON_LOG_DIR/devmon.log"
+}
+
+notify() {
+  local title="$1"
+  local message="$2"
+  [[ $DEVMON_NOTIFY -eq 0 ]] && return 0
+  osascript -e "display notification \"$message\" with title \"$title\"" 2>/dev/null || true
+}
+
+human_size() {
+  local bytes="$1"
+  echo "$bytes" | awk '{
+    if ($1 >= 1073741824) printf "%.1f GB", $1/1073741824
+    else if ($1 >= 1048576) printf "%.1f MB", $1/1048576
+    else if ($1 >= 1024) printf "%.1f KB", $1/1024
+    else printf "%d B", $1
+  }'
+}
+
+dir_size() {
+  local dir="$1"
+  [[ ! -d "$dir" ]] && echo "0" && return 0
+  du -sk "$dir" 2>/dev/null | awk '{print $1 * 1024}' || echo "0"
+}
+
+is_app_running() {
+  local app="$1"
+  pgrep -q "$app" 2>/dev/null
+}
+
+## Cleaner Functions
+
+clean_jetbrains_caches() {
+  printf "Cleaning JetBrains caches...\n"
+
+  # Check if any JetBrains IDE is running
+  if pgrep -q "pycharm|idea|webstorm|goland|rider|clion" 2>/dev/null; then
+    log "Skipping JetBrains - IDE is running"
+    printf "  ⊘ Skipping (IDE is running)\n"
+    return 0
+  fi
+
+  local cache_dir="$HOME/Library/Caches/JetBrains"
+  [[ ! -d "$cache_dir" ]] && printf "  ⊘ No JetBrains caches found\n" && return 0
+
+  local recovered=0
+  local cutoff_date
+  cutoff_date=$(date -v-${DEVMON_CACHE_JETBRAINS_MAX_DAYS}d '+%Y-%m-%d' 2>/dev/null || echo "")
+
+  # Clean stale IDE caches
+  while IFS= read -r dir; do
+    [[ -z "$dir" ]] && continue
+    local size
+    size=$(dir_size "$dir")
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+      printf "  [DRY RUN] Would remove: %s (%s)\n" "$(basename "$dir")" "$(human_size "$size")"
+    else
+      rm -rf "$dir" 2>/dev/null || true
+      recovered=$((recovered + size))
+      printf "  ✓ Removed: %s (%s)\n" "$(basename "$dir")" "$(human_size "$size")"
+    fi
+  done < <(find "$cache_dir" -mindepth 1 -maxdepth 1 -type d -mtime +${DEVMON_CACHE_JETBRAINS_MAX_DAYS} 2>/dev/null)
+
+  # Clean tmp directories regardless of age (always safe)
+  while IFS= read -r tmp_dir; do
+    [[ -z "$tmp_dir" ]] && continue
+    local size
+    size=$(dir_size "$tmp_dir")
+    [[ $size -eq 0 ]] && continue
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+      printf "  [DRY RUN] Would clean tmp: %s\n" "$(human_size "$size")"
+    else
+      rm -rf "$tmp_dir"/* 2>/dev/null || true
+      recovered=$((recovered + size))
+      printf "  ✓ Cleaned tmp: %s\n" "$(human_size "$size")"
+    fi
+  done < <(find "$cache_dir" -type d -name "tmp" 2>/dev/null)
+
+  TOTAL_RECOVERED=$((TOTAL_RECOVERED + recovered))
+  [[ $recovered -eq 0 ]] && printf "  ⊘ Nothing to clean\n"
+}
+
+clean_npm_cache() {
+  printf "Cleaning npm cache...\n"
+
+  command -v npm &>/dev/null || { printf "  ⊘ npm not found\n"; return 0; }
+
+  local npm_cache="$HOME/.npm/_cacache"
+  [[ ! -d "$npm_cache" ]] && printf "  ⊘ No npm cache found\n" && return 0
+
+  local size_before
+  size_before=$(dir_size "$npm_cache")
+  [[ $size_before -eq 0 ]] && printf "  ⊘ Cache is empty\n" && return 0
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf "  [DRY RUN] Would clean: %s\n" "$(human_size "$size_before")"
+  else
+    npm cache clean --force 2>/dev/null || true
+    local size_after
+    size_after=$(dir_size "$npm_cache")
+    local recovered=$((size_before - size_after))
+    TOTAL_RECOVERED=$((TOTAL_RECOVERED + recovered))
+    printf "  ✓ Cleaned: %s\n" "$(human_size "$recovered")"
+  fi
+}
+
+clean_pnpm_store() {
+  printf "Cleaning pnpm store...\n"
+
+  command -v pnpm &>/dev/null || { printf "  ⊘ pnpm not found\n"; return 0; }
+
+  local store_path
+  store_path=$(pnpm store path 2>/dev/null) || { printf "  ⊘ Cannot determine store path\n"; return 0; }
+  [[ ! -d "$store_path" ]] && printf "  ⊘ Store not found\n" && return 0
+
+  local size_before
+  size_before=$(dir_size "$store_path")
+  [[ $size_before -eq 0 ]] && printf "  ⊘ Store is empty\n" && return 0
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf "  [DRY RUN] Would prune store: %s\n" "$(human_size "$size_before")"
+  else
+    pnpm store prune 2>/dev/null || true
+    local size_after
+    size_after=$(dir_size "$store_path")
+    local recovered=$((size_before - size_after))
+    TOTAL_RECOVERED=$((TOTAL_RECOVERED + recovered))
+    [[ $recovered -gt 0 ]] && printf "  ✓ Pruned: %s\n" "$(human_size "$recovered")" || printf "  ⊘ Nothing to prune\n"
+  fi
+}
+
+clean_playwright_browsers() {
+  printf "Cleaning Playwright browsers...\n"
+
+  local pw_cache="$HOME/Library/Caches/ms-playwright"
+  [[ ! -d "$pw_cache" ]] && printf "  ⊘ No Playwright cache found\n" && return 0
+
+  local recovered=0
+
+  while IFS= read -r browser_dir; do
+    [[ -z "$browser_dir" ]] && continue
+    local size
+    size=$(dir_size "$browser_dir")
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+      printf "  [DRY RUN] Would remove: %s (%s)\n" "$(basename "$browser_dir")" "$(human_size "$size")"
+    else
+      rm -rf "$browser_dir" 2>/dev/null || true
+      recovered=$((recovered + size))
+      printf "  ✓ Removed: %s (%s)\n" "$(basename "$browser_dir")" "$(human_size "$size")"
+    fi
+  done < <(find "$pw_cache" -mindepth 1 -maxdepth 1 -type d -atime +${DEVMON_CACHE_PLAYWRIGHT_MAX_DAYS} 2>/dev/null)
+
+  TOTAL_RECOVERED=$((TOTAL_RECOVERED + recovered))
+  [[ $recovered -eq 0 ]] && printf "  ⊘ Nothing to clean\n"
+}
+
+clean_stale_node_modules() {
+  printf "Cleaning stale node_modules...\n"
+
+  local search_dirs=("$HOME/Projects" "$HOME/Developer" "$HOME/Code" "$HOME/dev" "$HOME/src" "$HOME/repos" "$HOME/workspace")
+  local recovered=0
+  local found_any=0
+
+  for search_dir in "${search_dirs[@]}"; do
+    [[ ! -d "$search_dir" ]] && continue
+    found_any=1
+
+    while IFS= read -r node_modules; do
+      [[ -z "$node_modules" ]] && continue
+
+      local parent_dir
+      parent_dir=$(dirname "$node_modules")
+      local package_json="$parent_dir/package.json"
+
+      # Check if package.json exists and is stale
+      if [[ -f "$package_json" ]]; then
+        local mtime
+        mtime=$(stat -f %m "$package_json" 2>/dev/null || echo "0")
+        local now
+        now=$(date +%s)
+        local age_days=$(( (now - mtime) / 86400 ))
+
+        if [[ $age_days -gt $DEVMON_CACHE_NODE_MODULES_MAX_DAYS ]]; then
+          local size
+          size=$(dir_size "$node_modules")
+
+          if [[ $DRY_RUN -eq 1 ]]; then
+            printf "  [DRY RUN] Would remove: %s (%s, %d days old)\n" "${node_modules/$HOME/~}" "$(human_size "$size")" "$age_days"
+          else
+            rm -rf "$node_modules" 2>/dev/null || true
+            recovered=$((recovered + size))
+            printf "  ✓ Removed: %s (%s, %d days old)\n" "${node_modules/$HOME/~}" "$(human_size "$size")" "$age_days"
+          fi
+        fi
+      fi
+    done < <(find "$search_dir" -maxdepth 4 -name "node_modules" -type d -prune 2>/dev/null)
+  done
+
+  TOTAL_RECOVERED=$((TOTAL_RECOVERED + recovered))
+  [[ $found_any -eq 0 ]] && printf "  ⊘ No project directories found\n" && return 0
+  [[ $recovered -eq 0 ]] && printf "  ⊘ Nothing to clean\n"
+}
+
+clean_homebrew() {
+  printf "Cleaning Homebrew downloads...\n"
+
+  command -v brew &>/dev/null || { printf "  ⊘ Homebrew not found\n"; return 0; }
+
+  local brew_cache
+  brew_cache=$(brew --cache 2>/dev/null) || { printf "  ⊘ Cannot determine cache location\n"; return 0; }
+
+  local size_before
+  size_before=$(dir_size "$brew_cache")
+  [[ $size_before -eq 0 ]] && printf "  ⊘ Cache is empty\n" && return 0
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf "  [DRY RUN] Would clean: %s\n" "$(human_size "$size_before")"
+  else
+    brew cleanup --prune=${DEVMON_CACHE_HOMEBREW_MAX_DAYS} 2>/dev/null || true
+    local size_after
+    size_after=$(dir_size "$brew_cache")
+    local recovered=$((size_before - size_after))
+    TOTAL_RECOVERED=$((TOTAL_RECOVERED + recovered))
+    [[ $recovered -gt 0 ]] && printf "  ✓ Cleaned: %s\n" "$(human_size "$recovered")" || printf "  ⊘ Nothing to clean\n"
+  fi
+}
+
+## Argument Parsing
+
+usage() {
+  cat << EOF
+DevMon Cache Cleanup
+
+Usage: devmon-cache-clean [OPTIONS]
+
+Options:
+  --dry-run    Preview what would be cleaned without deleting
+  --help       Show this help message
+
+Configuration (in ~/.config/devmon/config.sh):
+  DEVMON_CACHE_JETBRAINS_MAX_DAYS      (default: 7)
+  DEVMON_CACHE_PLAYWRIGHT_MAX_DAYS     (default: 14)
+  DEVMON_CACHE_NODE_MODULES_MAX_DAYS   (default: 30)
+  DEVMON_CACHE_HOMEBREW_MAX_DAYS       (default: 14)
+EOF
+  exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --help)
+      usage
+      ;;
+    *)
+      printf "Unknown option: %s\n" "$1"
+      usage
+      ;;
+  esac
+done
+
+## Main
+
+main() {
+  log "Cache cleanup started (dry_run=$DRY_RUN)"
+  printf "DevMon Cache Cleanup\n"
+  printf "════════════════════\n"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf "[DRY RUN] No files will be deleted\n\n"
+  fi
+
+  clean_jetbrains_caches
+  clean_npm_cache
+  clean_pnpm_store
+  clean_playwright_browsers
+  clean_stale_node_modules
+  clean_homebrew
+
+  printf "\n════════════════════\n"
+  local human
+  human=$(human_size "$TOTAL_RECOVERED")
+  printf "Total recovered: %s\n" "$human"
+  log "Cache cleanup complete: recovered $human (dry_run=$DRY_RUN)"
+
+  if [[ $DRY_RUN -eq 0 ]] && [[ $DEVMON_NOTIFY -eq 1 ]] && [[ $TOTAL_RECOVERED -gt 0 ]]; then
+    notify "Cache Cleanup" "Recovered $human of disk space"
+  fi
+}
+
+main
