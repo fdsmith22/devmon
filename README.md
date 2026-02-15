@@ -6,6 +6,10 @@ Built for developers who run Node.js, Vite, Webpack, Next.js, and other dev serv
 
 ![macOS](https://img.shields.io/badge/macOS-11%2B-blue) ![Swift](https://img.shields.io/badge/Swift-5.5%2B-orange) ![Bash](https://img.shields.io/badge/Bash-3.2%2B-green) ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
+<p align="center">
+  <img src="screenshot.png" alt="DevMon menu bar popover" width="340">
+</p>
+
 ## What It Does
 
 - **Monitors memory pressure** with color-coded status bar indicator and trend arrows
