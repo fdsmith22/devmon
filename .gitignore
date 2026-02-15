@@ -18,6 +18,9 @@ state/
 # Draft posts (not for repo)
 community-posts.md
 
+# OMC state
+.omc/
+
 # Editor
 .vscode/
 .idea/
