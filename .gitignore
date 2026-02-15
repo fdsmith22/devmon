@@ -15,6 +15,9 @@ DevMon.app/
 # State files
 state/
 
+# Draft posts (not for repo)
+community-posts.md
+
 # Editor
 .vscode/
 .idea/
